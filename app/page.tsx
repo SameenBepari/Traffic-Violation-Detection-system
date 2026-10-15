@@ -39,8 +39,13 @@ export default function TrafficViolationDashboard() {
   const [realtimeResults, setRealtimeResults] = useState<Array<{
     plate_number: string
     traffic_violation: string
+    violation_image: string | null
   }> | null>(null)
   const [webcamStream, setWebcamStream] = useState<MediaStream | null>(null)
+  const [isConnectedToBackend, setIsConnectedToBackend] = useState(false)
+  const [eventSource, setEventSource] = useState<EventSource | null>(null)
+  const [webcamInitialized, setWebcamInitialized] = useState(false)
+  const [detectionStatus, setDetectionStatus] = useState<"idle" | "detecting" | "detected">("idle")
 
   // Violation results
   const [violationResults, setViolationResults] = useState<Array<{
@@ -52,6 +57,7 @@ export default function TrafficViolationDashboard() {
     violations: string[]
     confidence: number
     screenshot: string
+    violation_image: string | null
   }> | null>(null)
 
   // Analytics data
@@ -67,8 +73,11 @@ export default function TrafficViolationDashboard() {
   // Refs
   const fileInputRef = useRef<HTMLInputElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const webcamRef = useRef<HTMLVideoElement>(null)
+  const frameCapturingRef = useRef<boolean>(false)
 
   const MAX_FILE_SIZE = 100 * 1024 * 1024 // 100MB limit
+  const API_URL = "http://localhost:5000" // Backend URL
 
   // Cleanup effect
   useEffect(() => {
@@ -137,31 +146,85 @@ export default function TrafficViolationDashboard() {
     setError(null)
 
     try {
-      // Simulate upload progress
-      const uploadTimer = simulateUploadProgress()
+      // Create form data for file upload
+      const formData = new FormData()
+      formData.append("file", selectedFile)
 
-      // After "upload" completes, start "analysis"
-      setTimeout(() => {
-        clearInterval(uploadTimer)
-        setUploadProgress(100)
-        setProcessingStage("analyzing")
+      // Track upload progress
+      const xhr = new XMLHttpRequest()
+      xhr.open("POST", `${API_URL}/upload`, true)
 
-        // Simulate analysis phase
-        setTimeout(() => {
-          // Generate mock results
-          const mockResults = generateMockResults()
-          const mockAnalytics = generateMockAnalytics(mockResults)
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          const progress = Math.round((event.loaded / event.total) * 100)
+          setUploadProgress(progress)
+        }
+      }
 
-          setViolationResults(mockResults)
-          setAnalytics(mockAnalytics)
+      xhr.onload = () => {
+        if (xhr.status === 200) {
+          setProcessingStage("analyzing")
+
+          // Parse the response
+          try {
+            const response = JSON.parse(xhr.responseText)
+            console.log("Received response:", response)
+
+            if (response.results && response.results.length > 0) {
+              // Transform the results to match our frontend format
+              const formattedResults = response.results.map((result: any, index: number) => {
+                // Split the traffic violations string into an array
+                const violations = result.traffic_violation.split(", ")
+
+                return {
+                  id: `VIO-${index + 1000}`,
+                  timestamp: new Date().toISOString(),
+                  location: "Detected Location",
+                  plate_number: result.plate_number,
+                  vehicle_type: result.plate_number.startsWith("Unknown") ? "Unknown" : "Motorcycle",
+                  violations: violations,
+                  confidence: 0.9, // Default confidence if not provided
+                  screenshot: result.violation_image
+                    ? `data:image/jpeg;base64,${result.violation_image}`
+                    : "/placeholder.svg?height=200&width=320",
+                  violation_image: result.violation_image,
+                }
+              })
+
+              console.log("Formatted results:", formattedResults)
+              setViolationResults(formattedResults)
+
+              // Generate analytics from the results
+              const analytics = generateAnalyticsFromResults(formattedResults)
+              setAnalytics(analytics)
+
+              setIsProcessing(false)
+              setProcessingStage("complete")
+              setActiveView("results")
+            } else {
+              setIsProcessing(false)
+              setError("No violations detected in the video.")
+            }
+          } catch (parseError) {
+            console.error("Error parsing response:", parseError)
+            setIsProcessing(false)
+            setError("Error parsing server response. Please try again.")
+          }
+        } else {
           setIsProcessing(false)
-          setProcessingStage("complete")
-          setActiveView("results")
-        }, 4500)
-      }, 7000)
+          setError(`Processing failed with status: ${xhr.status}. ${xhr.responseText}`)
+        }
+      }
+
+      xhr.onerror = () => {
+        setIsProcessing(false)
+        setError("Network error occurred. Please check your connection and try again.")
+      }
+
+      xhr.send(formData)
     } catch (error) {
       setIsProcessing(false)
-      setError("Processing failed. Please check your connection and try again.")
+      setError(`Processing failed: ${error instanceof Error ? error.message : "Unknown error"}`)
     }
   }
 
@@ -169,97 +232,99 @@ export default function TrafficViolationDashboard() {
   const startRealtimeDetection = async () => {
     setIsProcessing(true)
     setError(null)
-    setIsRealtimeActive(true)
     setRealtimeResults(null)
-    setActiveView("upload")
+    setWebcamInitialized(false)
+    setDetectionStatus("idle")
 
     try {
-      // Request access to the webcam
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true })
+      console.log("Requesting webcam access...")
+      // Request access to the webcam with specific constraints
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: "environment", // Use the back camera if available (for mobile)
+        },
+        audio: false,
+      })
+
+      console.log("Webcam access granted, setting up video element...")
       setWebcamStream(stream)
+      setIsRealtimeActive(true)
 
-      // In a real implementation, you would connect to your Flask backend's /realtime endpoint
-      // For this demo, we'll simulate results after a delay
+      // We'll handle the video element setup in the useEffect below
+      setWebcamInitialized(true)
+
+      // Start capturing frames after a short delay to ensure video is ready
       setTimeout(() => {
-        // Simulate real-time detection results
-        const mockRealtimeResults = [
-          {
-            plate_number: "RT" + Math.floor(Math.random() * 10000),
-            traffic_violation: "No helmet, Speeding",
-          },
-          {
-            plate_number: "RT" + Math.floor(Math.random() * 10000),
-            traffic_violation: "Lane violation",
-          },
-        ]
-
-        setRealtimeResults(mockRealtimeResults)
-
-        // In a real implementation, you would continuously receive updates from the backend
-        // Here we're just setting the processing state to false after getting initial results
         setIsProcessing(false)
-      }, 3000)
+        setIsConnectedToBackend(true)
+        console.log("Starting frame capture...")
+        frameCapturingRef.current = true
+        captureAndSendFrame() // Start the first capture
+      }, 2000)
     } catch (error) {
       console.error("Error accessing webcam:", error)
       setIsProcessing(false)
       setIsRealtimeActive(false)
-      setError("Failed to access webcam. Please ensure you have granted camera permissions.")
+      setError(
+        `Failed to access webcam: ${error instanceof Error ? error.message : "Unknown error"}. Please ensure you have granted camera permissions.`,
+      )
     }
   }
+
+  // Effect to set up webcam video element when stream is available
+  useEffect(() => {
+    if (webcamStream && webcamRef.current && webcamInitialized) {
+      console.log("Setting webcam stream to video element...")
+      webcamRef.current.srcObject = webcamStream
+
+      // Play the video and handle any errors
+      webcamRef.current.play().catch((err) => {
+        console.error("Error playing webcam stream:", err)
+        setError(`Error playing webcam stream: ${err.message}`)
+      })
+    }
+  }, [webcamStream, webcamInitialized])
 
   // Function to stop real-time detection
   const stopRealtimeDetection = () => {
+    console.log("Stopping real-time detection...")
+    frameCapturingRef.current = false
+
     if (webcamStream) {
-      webcamStream.getTracks().forEach((track) => track.stop())
+      webcamStream.getTracks().forEach((track) => {
+        console.log(`Stopping track: ${track.kind}`)
+        track.stop()
+      })
       setWebcamStream(null)
     }
+
+    if (eventSource) {
+      eventSource.close()
+      setEventSource(null)
+    }
+
     setIsRealtimeActive(false)
+    setIsConnectedToBackend(false)
     setRealtimeResults(null)
+    setWebcamInitialized(false)
+    setDetectionStatus("idle")
   }
 
-  // Helper functions for simulation
-  const simulateUploadProgress = () => {
-    return setInterval(() => {
-      setUploadProgress((prev) => {
-        if (prev >= 95) return 95
-        return prev + (Math.random() * 3 + 1)
-      })
-    }, 500)
-  }
-
-  const generateMockResults = () => {
-    return [
-      {
-        id: "VIO-" + Math.floor(Math.random() * 10000),
-        timestamp: new Date().toISOString(),
-        location: "",
-        plate_number: "AB0658",
-        vehicle_type: "Motorcycle",
-        violations: ["No helmet", "Speeding"],
-        confidence: 0.94,
-        screenshot: "/placeholder.svg?height=200&width=320",
-      },
-      {
-        id: "VIO-" + Math.floor(Math.random() * 10000),
-        timestamp: new Date(Date.now() - 120000).toISOString(),
-        location: "",
-        plate_number: "XYZ789",
-        vehicle_type: "Motorcycle",
-        violations: ["No helmet"],
-        confidence: 0.89,
-        screenshot: "/placeholder.svg?height=200&width=320",
-      },
-    ]
-  }
-
-  const generateMockAnalytics = (results: any[]) => {
+  // Helper function to generate analytics from results
+  const generateAnalyticsFromResults = (results: any[]) => {
     let noHelmetCount = 0
     let speedingCount = 0
+    let redLightCount = 0
+    let licensePlateIssues = 0
 
     results.forEach((result) => {
       result.violations.forEach((v: string) => {
-        if (v.includes("helmet")) noHelmetCount++
-        if (v.includes("Speeding")) speedingCount++
+        if (v.toLowerCase().includes("helmet")) noHelmetCount++
+        if (v.toLowerCase().includes("speeding")) speedingCount++
+        if (v.toLowerCase().includes("red light")) redLightCount++
+        if (v.toLowerCase().includes("license plate")) licensePlateIssues++
       })
     })
 
@@ -267,17 +332,17 @@ export default function TrafficViolationDashboard() {
       totalViolations: results.length,
       noHelmetCount,
       speedingCount,
-      redLightCount: 0,
-      licensePlateIssues: 0,
-      processingTime: 11.5,
+      redLightCount,
+      licensePlateIssues,
+      processingTime: Math.floor(Math.random() * 5) + 1, // Random processing time for demo
     }
   }
 
   // UI helper functions
   const getViolationColor = (violation: string): string => {
-    if (violation.includes("Speeding") || violation.includes("red light")) {
+    if (violation.toLowerCase().includes("speeding") || violation.toLowerCase().includes("red light")) {
       return "bg-red-600"
-    } else if (violation.includes("helmet") || violation.includes("License plate")) {
+    } else if (violation.toLowerCase().includes("helmet") || violation.toLowerCase().includes("license plate")) {
       return "bg-yellow-600"
     } else {
       return "bg-blue-600"
@@ -293,14 +358,114 @@ export default function TrafficViolationDashboard() {
     return (confidence * 100).toFixed(1) + "%"
   }
 
-  // Cleanup effect for webcam
+  // Cleanup effect for webcam and SSE
   useEffect(() => {
     return () => {
+      frameCapturingRef.current = false
       if (webcamStream) {
         webcamStream.getTracks().forEach((track) => track.stop())
       }
+      if (eventSource) {
+        eventSource.close()
+      }
     }
-  }, [webcamStream])
+  }, [webcamStream, eventSource])
+
+  // Function to capture a frame from the webcam and send it to the backend
+  const captureAndSendFrame = () => {
+    if (!webcamRef.current || !isRealtimeActive || !frameCapturingRef.current) {
+      console.log("Webcam not ready or detection not active, skipping frame capture")
+      return
+    }
+
+    const video = webcamRef.current
+
+    // Make sure video is ready and has dimensions
+    if (video.readyState !== video.HAVE_ENOUGH_DATA || video.videoWidth === 0) {
+      console.log("Video not ready yet, waiting...")
+      if (frameCapturingRef.current) {
+        setTimeout(captureAndSendFrame, 500)
+      }
+      return
+    }
+
+    console.log(`Capturing frame from video: ${video.videoWidth}x${video.videoHeight}`)
+    setDetectionStatus("detecting")
+
+    const canvas = document.createElement("canvas")
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+    const ctx = canvas.getContext("2d")
+
+    if (ctx && video) {
+      // Draw the current video frame to the canvas
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+      // Convert the canvas to a blob
+      canvas.toBlob(
+        (blob) => {
+          if (blob && frameCapturingRef.current) {
+            console.log(`Sending frame to backend (${blob.size} bytes)`)
+            // Create form data and append the blob
+            const formData = new FormData()
+            formData.append("frame", blob, "frame.jpg")
+
+            // Send the frame to the backend
+            fetch(`${API_URL}/process-frame`, {
+              method: "POST",
+              body: formData,
+            })
+              .then((response) => {
+                if (!response.ok) {
+                  throw new Error(`HTTP error! Status: ${response.status}`)
+                }
+                return response.json()
+              })
+              .then((data) => {
+                console.log("Received response:", data)
+                if (data.results && data.results.length > 0) {
+                  // Add timestamp to each result
+                  const resultsWithTimestamp = data.results.map((result: any) => ({
+                    ...result,
+                    timestamp: new Date().toISOString(),
+                  }))
+
+                  console.log("Processing results with images:", resultsWithTimestamp)
+                  setRealtimeResults(resultsWithTimestamp)
+                  setDetectionStatus("detected")
+                }
+
+                // Continue capturing frames if still active
+                if (frameCapturingRef.current) {
+                  setTimeout(captureAndSendFrame, 1000) // Capture every second
+                }
+              })
+              .catch((error) => {
+                console.error("Error sending frame:", error)
+                // Try again if still active
+                if (frameCapturingRef.current) {
+                  setTimeout(captureAndSendFrame, 2000) // Retry after 2 seconds on error
+                }
+              })
+          } else {
+            console.error("Failed to create blob from canvas or detection stopped")
+            // Try again if still active
+            if (frameCapturingRef.current) {
+              setTimeout(captureAndSendFrame, 1000)
+            }
+          }
+        },
+        "image/jpeg",
+        0.9,
+      )
+    } else {
+      console.error("Failed to get canvas context or video element is not valid")
+      // Try again if still active
+      if (frameCapturingRef.current) {
+        setTimeout(captureAndSendFrame, 1000)
+      }
+    }
+  }
 
   return (
     <div className="flex min-h-screen flex-col bg-gray-50">
@@ -440,6 +605,20 @@ export default function TrafficViolationDashboard() {
                   <h3 className="font-medium flex items-center">
                     <Camera className="h-4 w-4 mr-2" />
                     Real-time Detection
+                    {isConnectedToBackend && (
+                      <span className="ml-2 px-2 py-0.5 bg-green-100 text-green-800 text-xs rounded-full">
+                        Connected
+                      </span>
+                    )}
+                    {detectionStatus === "detecting" && (
+                      <span className="ml-2 px-2 py-0.5 bg-yellow-100 text-yellow-800 text-xs rounded-full flex items-center">
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        Analyzing
+                      </span>
+                    )}
+                    {detectionStatus === "detected" && (
+                      <span className="ml-2 px-2 py-0.5 bg-blue-100 text-blue-800 text-xs rounded-full">Detected</span>
+                    )}
                   </h3>
                   <button
                     onClick={stopRealtimeDetection}
@@ -449,36 +628,47 @@ export default function TrafficViolationDashboard() {
                   </button>
                 </div>
                 <div className="p-4">
-                  {webcamStream && (
-                    <video
-                      ref={(video) => {
-                        if (video && webcamStream) {
-                          video.srcObject = webcamStream
-                          video.play()
-                        }
-                      }}
-                      className="w-full h-auto max-h-[500px] rounded"
-                      autoPlay
-                      playsInline
-                      muted
-                    />
-                  )}
+                  <video
+                    ref={webcamRef}
+                    className="w-full h-auto max-h-[500px] rounded border bg-black"
+                    autoPlay
+                    playsInline
+                    muted
+                  />
+                  <p className="text-xs text-gray-500 mt-2">
+                    If the camera appears black, please check your camera permissions and ensure your browser has access
+                    to your camera.
+                  </p>
                 </div>
 
                 {/* Real-time results */}
                 {realtimeResults && realtimeResults.length > 0 && (
                   <div className="border-t p-4">
                     <h4 className="font-medium mb-3">Live Detection Results:</h4>
-                    <div className="space-y-2">
+                    <div className="space-y-4">
                       {realtimeResults.map((result, idx) => (
-                        <div key={idx} className="bg-gray-50 p-3 rounded border flex justify-between items-center">
-                          <div>
-                            <span className="font-mono bg-black text-white px-2 py-0.5 rounded mr-2">
-                              {result.plate_number}
-                            </span>
-                            <span className="text-sm text-gray-700">{result.traffic_violation}</span>
+                        <div key={idx} className="bg-gray-50 p-3 rounded border">
+                          <div className="flex justify-between items-center mb-2">
+                            <div>
+                              <span className="font-mono bg-black text-white px-2 py-0.5 rounded mr-2">
+                                {result.plate_number}
+                              </span>
+                              <span className="text-sm text-gray-700">{result.traffic_violation}</span>
+                            </div>
+                            <span className="text-xs bg-red-100 text-red-800 px-2 py-1 rounded">LIVE</span>
                           </div>
-                          <span className="text-xs bg-red-100 text-red-800 px-2 py-1 rounded">LIVE</span>
+                          {result.violation_image && (
+                            <div className="mt-2">
+                              <img
+                                src={`data:image/jpeg;base64,${result.violation_image}`}
+                                alt="Violation detected"
+                                className="w-full h-auto rounded border"
+                              />
+                              <p className="text-xs text-gray-500 mt-1">
+                                Violation detected at {new Date().toLocaleTimeString()}
+                              </p>
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -488,7 +678,7 @@ export default function TrafficViolationDashboard() {
             )}
 
             {/* Process buttons */}
-            {selectedFile && !isProcessing && (
+            {selectedFile && !isProcessing && !isRealtimeActive && (
               <div className="flex justify-center space-x-4">
                 <button
                   onClick={processVideo}
@@ -501,7 +691,7 @@ export default function TrafficViolationDashboard() {
             )}
 
             {/* Real-time detection button */}
-            {!isProcessing && (
+            {!isProcessing && !isRealtimeActive && (
               <div className="bg-white rounded-xl shadow-sm border p-6 mt-6">
                 <h2 className="text-lg font-semibold mb-4">Real-time Detection</h2>
                 <p className="text-gray-600 mb-4">
@@ -510,7 +700,7 @@ export default function TrafficViolationDashboard() {
                 </p>
                 <div className="flex justify-center">
                   <button
-                    onClick={() => startRealtimeDetection()}
+                    onClick={startRealtimeDetection}
                     className="px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors flex items-center shadow-sm"
                   >
                     <Camera className="h-5 w-5 mr-2" />
@@ -667,7 +857,11 @@ export default function TrafficViolationDashboard() {
                     <div className="p-4 grid grid-cols-1 md:grid-cols-3 gap-6">
                       <div className="md:col-span-1">
                         <img
-                          src={result.screenshot || "/placeholder.svg"}
+                          src={
+                            result.violation_image
+                              ? `data:image/jpeg;base64,${result.violation_image}`
+                              : "/placeholder.svg?height=200&width=320"
+                          }
                           alt="Violation screenshot"
                           className="w-full h-auto rounded border"
                         />
